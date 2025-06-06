@@ -1,408 +1,228 @@
 import ccxt
-import pandas as pd
-from datetime import datetime, timedelta
+import os
 import time
+import requests
+from dotenv import load_dotenv
+import pandas as pd
+import ta
+import datetime
 
 # ───────────────────────────────
-# 1. 업비트 객체 생성 (백테스팅용, 실제 키 필요 없음)
+# 1. 환경변수 로드 (백테스트는 API 키 필요 없지만, 원본 코드 유지)
 # ───────────────────────────────
-upbit = ccxt.upbit()
-
-# ───────────────────────────────
-# 2. 기술 지표 계산 함수 (MACD, RSI, ADX) - 기존 코드와 동일
-# ───────────────────────────────
-def compute_indicators(df):
-    if len(df) < 60:
-        return df
-
-    df['EMA_20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['EMA_60'] = df['close'].ewm(span=60, adjust=False).mean()
-
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-
-    df['H_L'] = df['high'] - df['low']
-    df['H_prevC'] = abs(df['high'] - df['close'].shift(1))
-    df['L_prevC'] = abs(df['low'] - df['close'].shift(1))
-    df['TR'] = df[['H_L', 'H_prevC', 'L_prevC']].max(axis=1)
-
-    df['up_move'] = df['high'] - df['high'].shift(1)
-    df['down_move'] = df['low'].shift(1) - df['low']
-
-    df['PlusDM'] = 0.0
-    df['MinusDM'] = 0.0
-
-    # 주의: 백테스팅에서는 loop를 돌면서 계산해도 괜찮지만, 실제 봇에서는 성능 이슈가 있을 수 있음.
-    # ADX 계산은 충분한 데이터가 필요하며, 누락된 값이 있을 수 있으므로 fillna(0) 처리
-    for i in range(1, len(df)):
-        if df['up_move'].iloc[i] > df['down_move'].iloc[i] and df['up_move'].iloc[i] > 0:
-            df.loc[df.index[i], 'PlusDM'] = df['up_move'].iloc[i]
-        elif df['down_move'].iloc[i] > df['up_move'].iloc[i] and df['down_move'].iloc[i] > 0:
-            df.loc[df.index[i], 'MinusDM'] = df['down_move'].iloc[i]
-
-    df['ATR'] = df['TR'].ewm(span=14, adjust=False).mean()
-
-    df['PlusDI'] = (df['PlusDM'].ewm(span=14, adjust=False).mean() / df['ATR']) * 100
-    df['MinusDI'] = (df['MinusDM'].ewm(span=14, adjust=False).mean() / df['ATR']) * 100
-
-    df['DX'] = (abs(df['PlusDI'] - df['MinusDI']) / (df['PlusDI'] + df['MinusDI'])).fillna(0) * 100
-    df['ADX'] = df['DX'].ewm(span=14, adjust=False).mean()
-
-    return df
+load_dotenv()
+api_key = os.getenv('UPBIT_API_KEY')
+secret_key = os.getenv('UPBIT_SECRET_KEY')
 
 # ───────────────────────────────
-# 3. 백테스팅 설정
+# 2. 업비트 객체 생성 (데이터 로딩용)
 # ───────────────────────────────
-SYMBOL = 'BTC/KRW'
-TIMEFRAME = '4h'
-MAX_OHLCV_LIMIT = 200 # ccxt fetch_ohlcv의 최대 limit
-
-# 백테스팅 시작 및 종료 날짜 설정 (약 3년 전부터 현재까지)
-end_date = datetime.now()
-start_date = end_date - timedelta(days=3 * 365) # 약 3년
-
-# 백테스팅 초기 자본금
-INITIAL_KRW_BALANCE = 10_000_000 # 1,000만원 시작
-
-# 매매 설정 (실제 봇 코드와 동일하게 적용)
-PERCENTAGE_OF_KRW_BALANCE_TO_INVEST = 0.20 # 가용 원화 잔고의 20%를 매매에 사용 (총 투자금)
-MIN_TRADE_KRW = 5000 # 업비트 최소 주문 금액
-TRADING_FEE_RATE = 0.0005 # 업비트 거래 수수료 0.05% (매수/매도 각각)
-
-# 리스크 관리 설정
-TRAILING_STOP_PERCENTAGE = 0.03 # 3% 하락 시 트레일링 스톱 발동
-INITIAL_STOP_LOSS_PERCENTAGE = 0.05 # 5% 하락 시 하드 손절
-BUY_DIP_PERCENTAGE = 0.01 # 1% 하락 시 2차 분할 매수
+upbit = ccxt.upbit({
+    'apiKey': api_key,
+    'secret': secret_key,
+    'options': {
+        'defaultType': 'spot',
+    },
+})
 
 # ───────────────────────────────
-# 4. 데이터 로드 함수
+# 3. 설정 값 (원본 코드와 동일)
 # ───────────────────────────────
-def fetch_all_ohlcv(symbol, timeframe, since, limit):
+MIN_ORDER_KRW = 5000 # 업비트 BTC/KRW 최소 주문 금액
+RSI_PERIOD = 14
+RSI_BUY_THRESHOLD = 35
+RSI_SELL_THRESHOLD = 55
+TRADE_COOLDOWN_SECONDS = 300 # 5분 (백테스트에서는 시간 단위로 시뮬레이션되므로, 의미가 약간 다름)
+FEE_RATE = 0.0005 # 업비트 거래 수수료 (시장가 기준 0.05%)
+
+# ───────────────────────────────
+# 4. 백테스트 함수
+# ───────────────────────────────
+def run_backtest(start_date_str, end_date_str, initial_krw_balance):
+    print(f"🚀 백테스트 시작: {start_date_str} ~ {end_date_str}\n")
+
+    # 데이터 로드
+    symbol = 'BTC/KRW'
+    timeframe = '1h'
     all_ohlcv = []
-    current_timestamp = since
-    while True:
-        print(f"데이터 로드 중: {datetime.fromtimestamp(current_timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')} 부터...")
-        ohlcv = upbit.fetch_ohlcv(symbol, timeframe, current_timestamp, limit)
-        if not ohlcv:
-            break
-        all_ohlcv.extend(ohlcv)
-        # 다음 fetch를 위해 마지막 데이터의 타임스탬프를 기준으로 설정
-        current_timestamp = ohlcv[-1][0] + 1 # 마지막 봉의 다음 밀리초부터
-
-        # 무한 루프 방지: 현재 시간까지 데이터를 모두 가져왔으면 중단
-        if datetime.fromtimestamp(current_timestamp / 1000) > datetime.now():
-            break
-        # API 요청 제한을 준수하기 위한 대기
-        time.sleep(0.1) # Upbit API는 초당 10회 요청 제한
-
-    # 중복 제거 및 시간 순서 정렬
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df.drop_duplicates(subset=['timestamp'], inplace=True)
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    return df
-
-# ───────────────────────────────
-# 5. 백테스팅 메인 함수
-# ───────────────────────────────
-def run_backtest():
-    print(f"📊 백테스팅 시작: {start_date.strftime('%Y-%m-%d')} 부터 {end_date.strftime('%Y-%m-%d')} 까지")
-    print(f"초기 자본금: {INITIAL_KRW_BALANCE:,.0f} KRW")
-
-    # 모든 과거 데이터 로드
-    ohlcv_df = fetch_all_ohlcv(SYMBOL, TIMEFRAME, int(start_date.timestamp() * 1000), MAX_OHLCV_LIMIT)
     
-    if ohlcv_df.empty:
-        print("❌ 백테스팅을 위한 OHLCV 데이터가 없습니다. 날짜 범위 또는 API 연결을 확인하세요.")
+    start_timestamp_ms = upbit.parse8601(start_date_str + 'T00:00:00Z')
+    end_timestamp_ms = upbit.parse8601(end_date_str + 'T23:59:59Z')
+
+    current_timestamp = start_timestamp_ms
+    limit = 200 # 한 번에 가져올 수 있는 최대 데이터 개수
+
+    print("데이터 로딩 중...")
+    while current_timestamp <= end_timestamp_ms:
+        try:
+            ohlcv = upbit.fetch_ohlcv(symbol, timeframe, since=current_timestamp, limit=limit)
+            if not ohlcv:
+                # 더 이상 데이터가 없거나, 끝점에 도달하면 종료
+                break
+            
+            # 마지막 데이터의 타임스탬프가 end_timestamp_ms를 초과하는지 확인
+            if ohlcv[-1][0] > end_timestamp_ms:
+                # 필요한 기간까지만 포함
+                for i in range(len(ohlcv)):
+                    if ohlcv[i][0] > end_timestamp_ms:
+                        ohlcv = ohlcv[:i]
+                        break
+            
+            all_ohlcv.extend(ohlcv)
+            
+            # 다음 요청을 위해 마지막 데이터의 타임스탬프 + 1시간
+            if ohlcv: # ohlcv가 비어있지 않은 경우에만 업데이트
+                current_timestamp = ohlcv[-1][0] + (60 * 60 * 1000) 
+            else: # ohlcv가 비어있으면 더 이상 데이터가 없다는 의미이므로 루프 종료
+                break
+            
+            # 목표 기간을 초과하면 데이터 로딩 중단
+            if current_timestamp > end_timestamp_ms and ohlcv:
+                break
+
+            time.sleep(0.05) # 과도한 요청 방지
+        except Exception as e:
+            print(f"데이터 로딩 중 오류 발생: {e}")
+            time.sleep(5)
+            continue
+    
+    if not all_ohlcv:
+        print("❌ 지정된 기간 동안의 데이터를 불러오지 못했습니다. 백테스트를 중단합니다.")
         return
 
-    ohlcv_df['datetime'] = pd.to_datetime(ohlcv_df['timestamp'], unit='ms')
-    ohlcv_df = ohlcv_df.set_index('datetime')
-    ohlcv_df.index = ohlcv_df.index.tz_localize('UTC').tz_convert('Asia/Seoul')
+    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    df['close'] = pd.to_numeric(df['close'])
 
-    # 백테스팅 시뮬레이션 변수 초기화
-    current_krw_balance = INITIAL_KRW_BALANCE
-    current_btc_balance = 0
-    last_buy_price = 0
-    highest_price_after_buy = 0
-    buy_step = 0 # 0: 대기, 1: 1차 매수 완료, 2: 2차 매수 완료
+    # RSI 계산 ( 충분한 과거 데이터 필요 )
+    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=RSI_PERIOD).rsi()
+    df.dropna(inplace=True) # RSI 계산을 위해 NaN 값 제거
 
-    trade_history = [] # 거래 내역 저장
-    monthly_returns = {} # 월별 수익률 저장
+    # 백테스트 시작 일자와 RSI 계산으로 인해 데이터 시작 일자가 달라질 수 있음.
+    # 시작 일자를 기준으로 다시 필터링
+    df = df[df.index >= pd.to_datetime(start_date_str)]
+    
+    if df.empty:
+        print("❌ RSI 계산 후 유효한 데이터가 없습니다. 백테스트를 중단합니다.")
+        return
 
-    # 지표 계산에 필요한 최소 데이터 포인트
-    min_required_data_for_indicators = max(60, 26 + 9, 14 * 2) 
+    print(f"\n✅ 총 {len(df)}개의 데이터 포인트 로드 및 준비 완료. 백테스트 시뮬레이션 시작...\n")
+    
+    # 백테스트 변수 초기화
+    krw_balance = initial_krw_balance
+    btc_balance = 0.0
+    total_trades = 0
+    trade_cooldown_end_time = datetime.datetime.min # 거래 쿨다운 종료 시간
 
-    # 백테스팅 루프
-    # df.iterrows() 대신 range(len(df))를 사용하는 것이 인덱스 기반 접근에 유리
-    for i in range(len(ohlcv_df)):
-        # 데이터가 충분하지 않으면 지표 계산 스킵
-        if i < min_required_data_for_indicators + 1: # +1은 이전 봉 지표 비교를 위함
-            continue
+    # 월별 수익률 기록
+    monthly_results = {}
+    # 백테스트 시작 시점의 총 자산을 해당 월의 시작 자산으로 설정
+    current_month_start_asset = initial_krw_balance
+    last_processed_month = df.index[0].strftime('%Y-%m')
 
-        # 현재 봉과 이전 봉 데이터 가져오기
-        current_candle = ohlcv_df.iloc[i]
-        prev_candle = ohlcv_df.iloc[i-1] # 이전 봉
+    # 시뮬레이션 시작
+    for idx, row in df.iterrows():
+        current_time = idx # DatetimeIndex 직접 사용
+        current_price = row['close']
+        current_rsi = row['rsi']
 
-        # 지표 계산 (매 루프마다 전체 DF를 계산하는 것은 비효율적이나, 백테스팅 편의상 이렇게 구현)
-        # 실제로는 새로운 봉이 추가될 때마다 필요한 지표만 업데이트하는 것이 성능상 유리
-        temp_df = ohlcv_df.iloc[:i+1].copy() # 현재까지의 데이터만 복사하여 지표 계산
-        computed_df = compute_indicators(temp_df)
+        # 월이 바뀌는 시점 처리
+        if current_time.strftime('%Y-%m') != last_processed_month:
+            # 이전 월의 마지막 자산 = 현재까지의 KRW 잔고 + (BTC 잔고 * 이전 월 마지막 봉의 종가)
+            # (주의: 이 부분은 정확한 월말 자산 스냅샷이 아닌, 현재 loop 시점의 잔고와 이전 봉 종가를 사용)
+            # -> 더 정확한 월별 수익률 계산을 위해, 이전 월의 마지막 봉의 종가를 가져와야 합니다.
+            # 하지만 이미 DatetimeIndex를 순회하므로, 현재 `row`는 이미 다음 달의 첫 봉입니다.
+            # 따라서 `current_month_start_asset`은 현재 달의 첫 봉 시점의 총 자산이 되어야 합니다.
+            # 월별 수익률은 '이전 달의 시작 자산 대비 이전 달의 마지막 자산'으로 계산됩니다.
 
-        # 지표 계산에 필요한 데이터가 부족하면 스킵
-        if len(computed_df) < min_required_data_for_indicators + 1:
-            continue
-
-        current_price = current_candle['close']
-        
-        # 지표 값 로드
-        ema_20 = computed_df['EMA_20'].iloc[-1]
-        ema_60 = computed_df['EMA_60'].iloc[-1]
-        macd = computed_df['MACD'].iloc[-1]
-        macd_signal = computed_df['MACD_Signal'].iloc[-1]
-        macd_hist = computed_df['MACD_Hist'].iloc[-1]
-        adx = computed_df['ADX'].iloc[-1]
-        
-        ema_20_prev = computed_df['EMA_20'].iloc[-2]
-        ema_60_prev = computed_df['EMA_60'].iloc[-2]
-        macd_prev = computed_df['MACD'].iloc[-2]
-        macd_signal_prev = computed_df['MACD_Signal'].iloc[-2]
-
-        current_datetime = current_candle.name # 봉의 datetime 인덱스
-
-        # 🔔 현재 가용 원화 잔고에 따라 투자 금액 동적 설정
-        # 0.05% 수수료를 감안하여 투자금의 99.9%만 BTC로 바꿀 수 있다고 가정
-        total_investment_this_cycle_krw = current_krw_balance * PERCENTAGE_OF_KRW_BALANCE_TO_INVEST
-
-        # ───────────────────────────────
-        # ── 매수 조건 확인 ──
-        # ───────────────────────────────
-        if current_btc_balance == 0 and buy_step == 0:
-            golden_cross = (ema_20_prev < ema_60_prev and ema_20 >= ema_60)
-            macd_buy_signal = (macd_prev < macd_signal_prev and macd >= macd_signal and macd_hist > 0)
-            adx_strong_trend = (adx >= 25)
-
-            if golden_cross and macd_buy_signal and adx_strong_trend:
-                amount_to_buy_krw = total_investment_this_cycle_krw * 0.5
-                if amount_to_buy_krw < MIN_TRADE_KRW:
-                    amount_to_buy_krw = MIN_TRADE_KRW 
-
-                if current_krw_balance >= amount_to_buy_krw and amount_to_buy_krw >= MIN_TRADE_KRW:
-                    # 매수 시뮬레이션
-                    bought_btc_amount = (amount_to_buy_krw / current_price) * (1 - TRADING_FEE_RATE)
-                    current_btc_balance += bought_btc_amount
-                    current_krw_balance -= amount_to_buy_krw # 실제 지불 금액 (수수료 포함된 금액)
-                    
-                    last_buy_price = current_price
-                    highest_price_after_buy = current_price
-                    buy_step = 1
-                    
-                    trade_history.append({
-                        'datetime': current_datetime,
-                        'type': 'BUY_1ST',
-                        'price': current_price,
-                        'amount_btc': bought_btc_amount,
-                        'investment_krw': amount_to_buy_krw,
-                        'krw_balance': current_krw_balance,
-                        'btc_balance': current_btc_balance,
-                        'info': '1차 매수'
-                    })
-
-        # ───────────────────────────────
-        # ── 분할 매수 조건 확인 (1차 매수 후) ──
-        # ───────────────────────────────
-        elif buy_step == 1:
-            if current_price <= last_buy_price * (1 - BUY_DIP_PERCENTAGE):
-                amount_to_buy_krw = total_investment_this_cycle_krw * 0.5
-                if amount_to_buy_krw < MIN_TRADE_KRW:
-                    amount_to_buy_krw = MIN_TRADE_KRW 
-
-                if current_krw_balance >= amount_to_buy_krw and amount_to_buy_krw >= MIN_TRADE_KRW:
-                    # 매수 시뮬레이션
-                    bought_btc_amount = (amount_to_buy_krw / current_price) * (1 - TRADING_FEE_RATE)
-                    current_btc_balance += bought_btc_amount
-                    current_krw_balance -= amount_to_buy_krw # 실제 지불 금액
-                    
-                    # 2차 매수 시 평균 단가 업데이트
-                    # 정확한 평균 단가를 계산하려면 기존 BTC 수량과 매수 가격을 알아야 함
-                    # 백테스팅에서는 편의상 current_price를 last_buy_price로 갱신 (실제 봇에서는 avg_buy_price 활용)
-                    last_buy_price = current_price # 2차 매수 시점의 가격으로 업데이트
-                    highest_price_after_buy = current_price # 2차 매수 후 최고가 초기화
-                    buy_step = 2
-
-                    trade_history.append({
-                        'datetime': current_datetime,
-                        'type': 'BUY_2ND',
-                        'price': current_price,
-                        'amount_btc': bought_btc_amount,
-                        'investment_krw': amount_to_buy_krw,
-                        'krw_balance': current_krw_balance,
-                        'btc_balance': current_btc_balance,
-                        'info': '2차 분할 매수'
-                    })
-
-        # ───────────────────────────────
-        # ── 매도 조건 확인 (보유 중일 때) ──
-        # ───────────────────────────────
-        elif current_btc_balance > 0:
-            if current_price > highest_price_after_buy:
-                highest_price_after_buy = current_price
-            
-            # 트레일링 스톱 발동 조건
-            trailing_stop_activated = False
-            if last_buy_price > 0 and current_price > last_buy_price: # 수익 구간에서만 트레일링 스톱 적용
-                trailing_stop_price = highest_price_after_buy * (1 - TRAILING_STOP_PERCENTAGE)
-                if current_price <= trailing_stop_price:
-                    trailing_stop_activated = True
-
-            # 하드 손절 발동 조건
-            hard_stop_loss_activated = False
-            if last_buy_price > 0 and current_price <= last_buy_price * (1 - INITIAL_STOP_LOSS_PERCENTAGE):
-                hard_stop_loss_activated = True
-            
-            # 추세 반전 매도 조건
-            dead_cross = (ema_20_prev >= ema_60_prev and ema_20 < ema_60)
-            macd_sell_signal = (macd_prev >= macd_signal_prev and macd < macd_signal and macd_hist < 0)
-            trend_reversal_activated = (dead_cross and macd_sell_signal)
-
-            # 매도 실행
-            if trailing_stop_activated or hard_stop_loss_activated or trend_reversal_activated:
-                # 매도 시뮬레이션
-                sold_krw_amount = current_btc_balance * current_price * (1 - TRADING_FEE_RATE) # 수수료 제하고 들어오는 원화
-                current_krw_balance += sold_krw_amount
+            # 이전 월의 최종 자산 (current_time은 이미 새 월의 시작이므로, 이전 월의 마지막 봉을 찾아야 함)
+            # df.index에서 현재 인덱스(idx)의 바로 이전 인덱스를 찾기
+            prev_idx_loc = df.index.get_loc(idx) - 1
+            if prev_idx_loc >= 0: # 첫 봉이 아니라면
+                prev_time_index = df.index[prev_idx_loc]
+                prev_month_close = df.loc[prev_time_index, 'close']
+                prev_month_end_asset = krw_balance + (btc_balance * prev_month_close)
                 
-                trade_type = ""
-                if trailing_stop_activated:
-                    trade_type = "SELL_TRAILING_STOP"
-                    info_msg = "트레일링 스톱 매도"
-                elif hard_stop_loss_activated:
-                    trade_type = "SELL_STOP_LOSS"
-                    info_msg = "하드 손절 매도"
-                elif trend_reversal_activated:
-                    trade_type = "SELL_TREND_REVERSAL"
-                    info_msg = "추세 반전 매도"
+                # 이전 월의 수익률 계산
+                if current_month_start_asset > 0:
+                    monthly_profit_rate = ((prev_month_end_asset - current_month_start_asset) / current_month_start_asset) * 100
+                else: # 시작 자산이 0이거나 음수일 경우 (예외 처리)
+                    monthly_profit_rate = 0 
+                monthly_results[last_processed_month] = monthly_profit_rate
+                
+                # 다음 월의 시작 자산 업데이트
+                current_month_start_asset = prev_month_end_asset
+            
+            # 현재 월 업데이트
+            last_processed_month = current_time.strftime('%Y-%m')
 
-                trade_history.append({
-                    'datetime': current_datetime,
-                    'type': trade_type,
-                    'price': current_price,
-                    'amount_btc': current_btc_balance, # 전량 매도
-                    'received_krw': sold_krw_amount,
-                    'krw_balance': current_krw_balance,
-                    'btc_balance': 0, # 전량 매도했으므로 0
-                    'info': info_msg
-                })
 
-                current_btc_balance = 0
-                last_buy_price = 0
-                highest_price_after_buy = 0
-                buy_step = 0 # 매도 후 초기화
+        # 쿨다운 중인지 확인
+        if current_time < trade_cooldown_end_time:
+            continue # 쿨다운 중이면 거래 스킵
+
+        # ── 매수 조건 ──
+        if btc_balance == 0 and current_rsi <= RSI_BUY_THRESHOLD and krw_balance >= MIN_ORDER_KRW:
+            amount_to_buy_krw = krw_balance # KRW 전액 매수
+            
+            if amount_to_buy_krw >= MIN_ORDER_KRW: # 매수 금액이 최소 주문 금액 이상일 때만 진행
+                buy_amount_btc = (amount_to_buy_krw / current_price) * (1 - FEE_RATE) # 수수료 반영
+                krw_balance -= amount_to_buy_krw
+                btc_balance += buy_amount_btc
+                total_trades += 1
+                trade_cooldown_end_time = current_time + datetime.timedelta(seconds=TRADE_COOLDOWN_SECONDS)
         
-        # 월별 수익률 계산을 위한 현재 월 추적
-        current_month_year = current_datetime.strftime('%Y-%m')
-        
-        # 해당 월의 시작 잔고가 아직 기록되지 않았다면 기록
-        if current_month_year not in monthly_returns:
-            monthly_returns[current_month_year] = {
-                'start_krw': current_krw_balance,
-                'start_btc_krw_value': current_btc_balance * current_price,
-                'end_krw': current_krw_balance,
-                'end_btc_krw_value': current_btc_balance * current_price
-            }
-        
-        # 매번 봉이 진행될 때마다 현재 잔고를 업데이트 (마지막 봉에서 최종적으로 사용)
-        monthly_returns[current_month_year]['end_krw'] = current_krw_balance
-        monthly_returns[current_month_year]['end_btc_krw_value'] = current_btc_balance * current_price
+        # ── 매도 조건 ──
+        elif btc_balance > 0 and current_rsi >= RSI_SELL_THRESHOLD:
+            # 최소 매도 수량 고려 (업비트 BTC/KRW는 0.00008 BTC 정도이지만, 안전하게 0보다 크면 매도 시도)
+            if btc_balance * current_price >= MIN_ORDER_KRW: # BTC 보유액이 최소 매도 금액 이상일 때만 매도
+                sell_amount_btc = btc_balance
+                krw_received = sell_amount_btc * current_price * (1 - FEE_RATE)
+                krw_balance += krw_received
+                btc_balance = 0.0 # 전량 매도
+                total_trades += 1
+                trade_cooldown_end_time = current_time + datetime.timedelta(seconds=TRADE_COOLDOWN_SECONDS)
 
-    # ───────────────────────────────
-    # 6. 결과 출력
-    # ───────────────────────────────
-    print("\n--- 백테스팅 결과 ---")
-    final_krw_balance = current_krw_balance + (current_btc_balance * current_price) # 마지막 남은 BTC가 있다면 KRW로 환산
+    # 루프 종료 후 마지막 월의 수익률 계산
+    final_total_asset = krw_balance + (btc_balance * df['close'].iloc[-1]) # 최종 자산
+    if current_month_start_asset > 0:
+        monthly_profit_rate = ((final_total_asset - current_month_start_asset) / current_month_start_asset) * 100
+    else:
+        monthly_profit_rate = 0
+    monthly_results[last_processed_month] = monthly_profit_rate
 
-    total_return_krw = final_krw_balance - INITIAL_KRW_BALANCE
-    total_return_percentage = (total_return_krw / INITIAL_KRW_BALANCE) * 100 if INITIAL_KRW_BALANCE > 0 else 0
+    # 누적 수익률 계산
+    cumulative_return = ((final_total_asset - initial_krw_balance) / initial_krw_balance) * 100
 
-    print(f"최종 자본금: {final_krw_balance:,.0f} KRW")
-    print(f"총 수익 (KRW): {total_return_krw:,.0f} KRW")
-    print(f"총 수익률: {total_return_percentage:.2f} %")
+    # 결과 출력
+    print("\n" + "="*30)
+    print("📊 백테스트 결과")
+    print("="*30)
+    print(f"📈 초기 자산: {initial_krw_balance:,.0f} KRW")
+    print(f"📊 최종 자산: {final_total_asset:,.0f} KRW")
+    print(f"💰 최종 KRW 잔고: {krw_balance:,.0f} KRW")
+    print(f"₿ 최종 BTC 잔고: {btc_balance:.8f} BTC")
+    print(f"📈 누적 수익률: {cumulative_return:.2f} %")
+    print(f"총 거래 횟수: {total_trades}회")
 
     print("\n--- 월별 수익률 ---")
-    # 월별 수익률 계산 및 출력
-    monthly_summary = []
-    sorted_months = sorted(monthly_returns.keys())
+    total_cumulative_monthly_return = 1.0 # 누적 수익률 계산을 위한 변수 (곱셈)
+    sorted_months = sorted(monthly_results.keys())
+    for month in sorted_months:
+        rate = monthly_results[month]
+        print(f" {month}: {rate:.2f}%")
+        total_cumulative_monthly_return *= (1 + rate / 100)
+    
+    # 월별 합산 누적 수익률 (복리 계산)
+    final_monthly_cumulative_return_percentage = (total_cumulative_monthly_return - 1) * 100
+    print(f"\n누적 수익률 (월별 복리): {final_monthly_cumulative_return_percentage:.2f} %")
 
-    for i, month_year in enumerate(sorted_months):
-        data = monthly_returns[month_year]
-        start_total = data['start_krw'] + data['start_btc_krw_value']
-        end_total = data['end_krw'] + data['end_btc_krw_value']
-        
-        if i > 0: # 이전 달의 마지막 잔고를 이번 달의 시작 잔고로 가져옴 (연속성을 위함)
-            prev_month_data = monthly_returns[sorted_months[i-1]]
-            start_total = prev_month_data['end_krw'] + prev_month_data['end_btc_krw_value']
-            # 실제로 월별 수익률을 계산하기 위해 해당 월의 시작 시점 자산으로 보정
-            data['start_krw'] = start_total # 시작 자본을 실제 매달 시작 시점 기준으로 업데이트
-            
-        # 첫 달은 INITIAL_KRW_BALANCE를 시작 자본으로 사용
-        if i == 0:
-            start_total = INITIAL_KRW_BALANCE
-        else:
-            # 이전 달의 최종 자본이 이번 달의 시작 자본이 됨
-            # 이 로직은 `monthly_returns` 딕셔너리 내에서 `start_krw`와 `end_krw`를 직접 수정하는 것보다
-            # 매달 "가상의" 시작 자본을 계산하는 방식이 더 직관적일 수 있음
-            # 여기서는 마지막 봉이 끝난 시점의 잔고를 해당 월의 'end' 잔고로 보고, 다음 월의 'start' 잔고로 이어받는 개념
-            pass # 이미 루프 내에서 마지막 봉의 값이 업데이트되어있음
 
-        # 월별 수익률 계산 (해당 월의 최종 잔고 / 해당 월의 시작 잔고 - 1)
-        # 중요: 월별 수익률은 해당 월에 발생한 순 자산 변화를 기준으로 해야 합니다.
-        # 즉, 해당 월의 시작 시점의 총 자산과 종료 시점의 총 자산을 비교해야 합니다.
-        
-        # 현재는 각 월의 마지막 봉에서 기록된 end_krw와 end_btc_krw_value를 사용하고 있습니다.
-        # start_krw는 해당 월에 처음 진입했을 때의 KRW 잔고입니다.
-        # 실제 월별 수익률 계산은 `current_krw_balance + current_btc_balance * current_price`로
-        # 매 봉마다 현재 총 자산 가치를 계산하여 비교하는 것이 더 정확합니다.
-        
-        # 간략화된 월별 수익률 계산 (해당 월의 마지막 시점 총 자산 / 초기 자산)
-        # 이 방식은 누적 수익률에 가까움.
-        # 정확한 월별 수익률은 '해당 월의 (총 자산 증가분 / 월초 총 자산)'으로 계산해야 함.
-        
-        # 보다 정확한 월별 수익률 계산
-        if i == 0:
-            month_start_total = INITIAL_KRW_BALANCE
-        else:
-            prev_month_data = monthly_returns[sorted_months[i-1]]
-            month_start_total = prev_month_data['end_krw'] + prev_month_data['end_btc_krw_value']
-        
-        month_end_total = data['end_krw'] + data['end_btc_krw_value']
-        
-        if month_start_total > 0:
-            monthly_gain_percentage = ((month_end_total - month_start_total) / month_start_total) * 100
-        else: # 시작 자본이 0인 경우 (극히 드물지만)
-            monthly_gain_percentage = 0 if month_end_total == 0 else float('inf') # 자본 없는데 수익나면 무한대
-
-        monthly_summary.append({
-            'Month': month_year,
-            'Start_Balance': month_start_total,
-            'End_Balance': month_end_total,
-            'Monthly_Return_Perc': monthly_gain_percentage
-        })
-        print(f"{month_year}: {monthly_gain_percentage:.2f} %")
-
-    # 모든 거래 내역 출력 (선택 사항, 양이 많을 수 있음)
-    # trade_df = pd.DataFrame(trade_history)
-    # print("\n--- 전체 거래 내역 ---")
-    # print(trade_df.to_string()) # 모든 열을 출력
-
-    return {
-        'final_krw_balance': final_krw_balance,
-        'total_return_krw': total_return_krw,
-        'total_return_percentage': total_return_percentage,
-        'monthly_returns': monthly_summary,
-        'trade_history': trade_history
-    }
-
-if __name__ == '__main__':
-    results = run_backtest()
-    print("\n백테스팅 완료.")
+# ───────────────────────────────
+# 5. 백테스트 실행
+# ───────────────────────────────
+if __name__ == "__main__":
+    initial_balance = 10_000_000 # 1,000만 원 시작
+    # 2022년 1월 1일부터 2023년 12월 31일까지 백테스트
+    run_backtest('2022-01-01', '2023-12-31', initial_balance)
