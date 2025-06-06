@@ -21,8 +21,8 @@ upbit = ccxt.upbit({
 # ───────────────────────────────
 # 3. 설정 값
 # ───────────────────────────────
-buy_price_threshold = 40000000     # 4천만 원 이하일 때 매수
-sell_price_threshold = 45000000    # 4천5백만 원 이상일 때 매도
+buy_price_threshold = 142400000    # 4천만 원 이하일 때 매수
+sell_price_threshold = 142379000    # 4천5백만 원 이상일 때 매도
 krw_to_spend = 5000                # 매수 금액
 
 print("🚀 자동 매수·매도 봇 시작! 1분마다 시세 확인 중...\n")
@@ -46,7 +46,7 @@ while True:
         if current_price < buy_price_threshold and krw_balance >= krw_to_spend:
             amount = krw_to_spend / current_price
             print("💡 매수 조건 만족! 비트코인 매수 실행")
-            order = upbit.create_market_buy_order('BTC/KRW', round(amount, 8))
+            order = upbit.create_market_buy_order('BTC/KRW', krw_to_spend, params={"cost": krw_to_spend})
             print("✅ 매수 완료:", order)
             time.sleep(300)  # 5분 대기 후 재시작
 
