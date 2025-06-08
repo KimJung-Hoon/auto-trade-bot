@@ -1,276 +1,220 @@
-import ccxt 
-import os 
-import time 
-import requests 
-from dotenv import load_dotenv 
-import pandas as pd 
-import ta 
+import ccxt
+import os
+import time
+import requests
+import pandas as pd
+import ta
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 # ───────────────────────────────
-# 1. 환경변수 로드 (백테스트에서는 API 키 사용 안 함)
+# 1. 환경변수 로드 (백테스팅에는 실제 키 필요 없음, 에러 방지용)
 # ───────────────────────────────
 load_dotenv()
-# 백테스트에서는 실제 API 키 및 텔레그램 토큰 사용 안 함
-# telegram_token = os.getenv('TELEGRAM_TOKEN') 
-# telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID') 
+api_key          = os.getenv('UPBIT_API_KEY') # 실제 사용되지 않지만, ccxt 객체 생성 시 필요
+secret_key       = os.getenv('UPBIT_SECRET_KEY') # 실제 사용되지 않지만, ccxt 객체 생성 시 필요
 
 # ───────────────────────────────
-# 2. 업비트 객체 생성 (데이터 로드용)
+# 2. CCXT 업비트 객체 생성 (데이터 로드용)
 # ───────────────────────────────
-# 백테스트에서는 실제 거래가 아닌 데이터 로드용으로만 사용
-upbit = ccxt.upbit({ 
-    'options': { 
-        'defaultType': 'spot', 
-    }, 
-}) 
-
-# ───────────────────────────────
-# 3. 텔레그램 전송 함수 (백테스트에서는 사용 안 함)
-# ───────────────────────────────
-def send_telegram(message):
-    # 백테스트에서는 텔레그램 메시지 전송하지 않음
-    pass
+upbit = ccxt.upbit({
+    'apiKey': api_key if api_key else 'YOUR_DUMMY_API_KEY', # 더미 키 사용 가능
+    'secret': secret_key if secret_key else 'YOUR_DUMMY_SECRET_KEY', # 더미 키 사용 가능
+    'enableRateLimit': True # 데이터 요청 속도 제한 준수
+})
+upbit.load_markets()
 
 # ───────────────────────────────
-# 4. 설정 값 (자동매매 코드와 동일하게 유지)
+# 3. 전략 파라미터 (원본 코드와 동일)
 # ───────────────────────────────
-MIN_ORDER_KRW = 5000 # 업비트 BTC/KRW 최소 주문 금액 (백테스트에서도 동일 적용)
-TRADE_FEE_RATE = 0.0005 # 업비트 수수료 0.05%
+MA_SHORT        = 20      # 단기 이동평균 기간 (일)
+MA_LONG         = 50      # 장기 이동평균 기간 (일)
+MDI_WINDOW      = 14      # MDI 계산 기간 (일)
+MDI_BUY_THRESH  = 15      # 매수 시 MDI 기준치
+MDI_SELL_THRESH = 27      # 매도 시 MDI 기준치
+STOP_LOSS_PCT   = 0.06    # 손절 비율 (6%)
+MIN_KRW_TRADE   = 5000    # 업비트 최소 거래 금액 (KRW)
+TRADE_FEE_RATE  = 0.0005  # 업비트 시장가 수수료율 (0.05%)
 
-RSI_PERIOD = 14 
-RSI_BUY_THRESHOLD = 35 
-RSI_SELL_THRESHOLD = 55 # 요청에 따라 55로 설정
-
-MA_SHORT_PERIOD = 50 
-MA_LONG_PERIOD = 200 
-
-STOP_LOSS_PERCENT = 0.05 
+symbol          = 'BTC/KRW'
+timeframe       = '1d'    # 일봉
 
 # ───────────────────────────────
-# 5. 백테스트 설정
+# 4. 백테스팅 설정 (기간 변경)
 # ───────────────────────────────
-INITIAL_KRW_BALANCE = 1000000 # 초기 자본금 100만원
-BACKTEST_PERIOD_DAYS = 365 * 2 # 2년치 데이터 (365일 * 2)
+INITIAL_BALANCE_KRW = 1_000_000 # 초기 투자금 (100만원)
 
-print("🚀 비트코인 자동매매 백테스트 시작!\n")
+# 백테스팅 시작 및 종료 날짜 명시적 설정
+# 지표 계산을 위한 충분한 과거 데이터 확보를 위해 실제 시작일보다 더 이전부터 데이터를 가져옵니다.
+data_fetch_start_date = datetime(2018, 10, 1) # 2019년 시작 + 넉넉하게 3개월 전
+backtest_start_date   = datetime(2019, 1, 1)
+backtest_end_date     = datetime(2020, 12, 31)
 
-def run_backtest():
-    # 백테스트 시작 및 종료 날짜 설정
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=BACKTEST_PERIOD_DAYS)
+print("--- 백테스팅 시작 ---")
+print(f"백테스팅 기간: {backtest_start_date.strftime('%Y-%m-%d')} ~ {backtest_end_date.strftime('%Y-%m-%d')}")
+print(f"초기 투자금: {INITIAL_BALANCE_KRW:,.0f} KRW")
+print(f"전략: MA{MA_SHORT}/MA{MA_LONG} & MDI({MDI_WINDOW}) 매수({MDI_BUY_THRESH})/매도({MDI_SELL_THRESH}) & 손절({STOP_LOSS_PCT*100}%)")
+print(f"수수료: {TRADE_FEE_RATE*100}%, 최소 거래: {MIN_KRW_TRADE}원")
 
-    print(f"백테스트 기간: {start_date.strftime('%Y-%m-%d %H:%M:%S')} 부터 {end_date.strftime('%Y-%m-%d %H:%M:%S')} 까지")
+# ───────────────────────────────
+# 5. 과거 데이터 로드
+# ───────────────────────────────
+all_ohlcv = []
+current_fetch_start = data_fetch_start_date # 데이터 로드 시작 지점 변경
 
-    # 과거 1시간봉 데이터 로드
-    all_ohlcv = []
-    current_fetch_time = start_date
+while current_fetch_start <= backtest_end_date + timedelta(days=1): # 종료일 다음 날까지 데이터 로드
+    try:
+        since_ms = upbit.parse8601(current_fetch_start.isoformat() + 'Z')
+        chunk = upbit.fetch_ohlcv(symbol, timeframe=timeframe, since=since_ms, limit=200)
+        if not chunk:
+            break
+        all_ohlcv.extend(chunk)
+        current_fetch_start = datetime.fromtimestamp(chunk[-1][0] / 1000) + timedelta(days=1)
+        time.sleep(upbit.rateLimit / 1000)
+    except Exception as e:
+        print(f"데이터 로드 중 오류 발생: {e}")
+        break
+
+df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+df.set_index('timestamp', inplace=True)
+df = df.drop_duplicates(keep='first')
+df = df.sort_index()
+
+# ───────────────────────────────
+# 6. 지표 계산 및 전략 적용
+# ───────────────────────────────
+df['ma_short'] = df['close'].rolling(MA_SHORT).mean()
+df['ma_long']  = df['close'].rolling(MA_LONG).mean()
+adx = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=MDI_WINDOW, fillna=False)
+df['mdi'] = adx.adx_neg()
+df.dropna(inplace=True)
+
+# 실제 백테스팅 시작 날짜 이후 데이터만 사용
+df = df[df.index >= backtest_start_date]
+df = df[df.index <= backtest_end_date] # 2020년 12월 31일까지의 데이터만 포함
+
+# ───────────────────────────────
+# 7. 백테스팅 시뮬레이션
+# ───────────────────────────────
+balance_krw = INITIAL_BALANCE_KRW
+balance_btc = 0
+last_buy_price = 0
+portfolio_values = []
+monthly_returns = {} # 월별 수익률을 저장할 딕셔너리
+
+prev_ma_short = None
+prev_ma_long  = None
+
+for i in range(len(df)):
+    current_date = df.index[i]
+    today_close  = df['close'].iloc[i]
+    curr_ma_short = df['ma_short'].iloc[i]
+    curr_ma_long  = df['ma_long'].iloc[i]
+    curr_mdi      = df['mdi'].iloc[i]
+
+    # 이전 데이터가 없으면 초기화 (df.dropna로 인해 첫 인덱스는 지표가 계산된 첫 날이 됨)
+    if i == 0:
+        prev_ma_short = curr_ma_short
+        prev_ma_long  = curr_ma_long
+        # 첫 날 포트폴리오 가치 기록
+        portfolio_values.append({
+            'date': current_date,
+            'krw': balance_krw,
+            'btc': balance_btc,
+            'total_krw': balance_krw + balance_btc * today_close
+        })
+        continue
+
+    # 4) 손절 조건 (6% 손실)
+    if last_buy_price and balance_btc > 0:
+        if today_close <= last_buy_price * (1 - STOP_LOSS_PCT):
+            sell_amount_krw = balance_btc * today_close * (1 - TRADE_FEE_RATE)
+            balance_krw += sell_amount_krw
+            balance_btc = 0
+            last_buy_price = 0
+            # print(f"[{current_date.strftime('%Y-%m-%d')}] ⚠️ 손절 매도! 가격: {today_close:,.0f}원, 잔고: {balance_krw:,.0f}원")
+
+    # 5) 매수 조건: 골든 크로스 발생 중 & MDI ≤ 기준 & KRW 보유
+    golden_cross_occurred = (prev_ma_short <= prev_ma_long and curr_ma_short > curr_ma_long)
+    golden_cross_maintained = (curr_ma_short > curr_ma_long)
+
+    eligible_krw_for_buy = balance_krw * (1 - TRADE_FEE_RATE)
+
+    if (golden_cross_occurred or golden_cross_maintained) and \
+       curr_mdi <= MDI_BUY_THRESH and \
+       eligible_krw_for_buy >= MIN_KRW_TRADE and \
+       balance_btc == 0:
+        
+        buy_amt_btc = eligible_krw_for_buy / today_close
+        
+        balance_btc = buy_amt_btc
+        balance_krw = 0
+        last_buy_price = today_close
+        # print(f"[{current_date.strftime('%Y-%m-%d')}] 💰 매수! 가격: {today_close:,.0f}원, 수량: {balance_btc:.8f} BTC")
+
+    # 6) 매도 조건: 데드 크로스 발생 중 OR MDI ≥ 기준 & BTC 보유
+    death_cross_occurred = (prev_ma_short >= prev_ma_long and curr_ma_short < curr_ma_long)
+    death_cross_maintained = (curr_ma_short < curr_ma_long)
+
+    if (death_cross_occurred or death_cross_maintained or curr_mdi >= MDI_SELL_THRESH) and \
+       balance_btc > 0:
+        
+        sell_amount_krw = balance_btc * today_close * (1 - TRADE_FEE_RATE)
+        balance_krw += sell_amount_krw
+        balance_btc = 0
+        last_buy_price = 0
+        # print(f"[{current_date.strftime('%Y-%m-%d')}] 📤 매도! 가격: {today_close:,.0f}원, 잔고: {balance_krw:,.0f}원")
     
-    # Upbit API 호출 제한 (1초에 60회) 고려, 한 번에 200개 데이터 가져옴
-    while current_fetch_time < end_date:
-        try:
-            # 타임스탬프는 밀리초 단위로 변환
-            ohlcv_chunk = upbit.fetch_ohlcv(
-                'BTC/KRW', 
-                '1h', 
-                since=int(current_fetch_time.timestamp() * 1000), 
-                limit=200
-            )
-            if not ohlcv_chunk:
-                break # 더 이상 데이터가 없으면 종료
-            all_ohlcv.extend(ohlcv_chunk)
-            # 다음 요청 시작 시간을 마지막 데이터의 시간 + 1시간으로 설정
-            current_fetch_time = datetime.fromtimestamp((all_ohlcv[-1][0] + 3600000) / 1000)
-            time.sleep(0.1) # Upbit API 요청 제한을 위한 대기
-            print(f"데이터 로드 중... 현재까지 {len(all_ohlcv)}개의 봉 데이터 확보. 마지막 봉 시각: {datetime.fromtimestamp(all_ohlcv[-1][0]/1000).strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # API 제한에 걸리지 않도록 넉넉하게 대기
-            if len(all_ohlcv) % 1000 == 0:
-                 time.sleep(1)
+    # 일별 포트폴리오 가치 기록
+    total_krw_value = balance_krw + balance_btc * today_close
+    portfolio_values.append({
+        'date': current_date,
+        'krw': balance_krw,
+        'btc': balance_btc,
+        'total_krw': total_krw_value
+    })
 
-        except ccxt.NetworkError as e:
-            print(f"❌ 네트워크 오류 발생: {e}. 잠시 후 재시도...")
-            time.sleep(5)
-        except ccxt.ExchangeError as e:
-            print(f"❌ 거래소 오류 발생: {e}. 잠시 후 재시도...")
-            time.sleep(5)
-        except Exception as e:
-            print(f"❌ 데이터 로드 중 예상치 못한 오류 발생: {e}. 잠시 후 재시도...")
-            time.sleep(5)
+    # 다음 루프를 위한 이전 MA 값 업데이트
+    prev_ma_short = curr_ma_short
+    prev_ma_long  = curr_ma_long
+
+# 최종 포트폴리오 가치 (마지막 날짜 기준)
+final_balance_krw = balance_krw + balance_btc * df['close'].iloc[-1]
+total_return = (final_balance_krw / INITIAL_BALANCE_KRW - 1) * 100
+
+print("\n--- 백테스팅 결과 ---")
+print(f"최종 포트폴리오 가치: {final_balance_krw:,.0f} KRW")
+print(f"총 수익률: {total_return:.2f}%")
+
+# 월별 수익률 계산
+portfolio_df = pd.DataFrame(portfolio_values)
+portfolio_df.set_index('date', inplace=True)
+portfolio_df['monthly_total_krw'] = portfolio_df['total_krw'].resample('M').last()
+
+print("\n--- 월별 수익률 ---")
+total_monthly_returns_list = [] # 월별 수익률 값을 저장할 리스트
+for month_end_date in portfolio_df['monthly_total_krw'].dropna().index:
+    current_month_value = portfolio_df.loc[month_end_date, 'monthly_total_krw']
     
-    if not all_ohlcv:
-        print("백테스트를 위한 과거 데이터를 충분히 불러오지 못했습니다. 종료합니다.")
-        return
-
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df['close'] = pd.to_numeric(df['close'])
+    prev_month_start_value = INITIAL_BALANCE_KRW # 초기 투자금으로 시작
+    prev_month_end_dt = month_end_date - pd.DateOffset(months=1)
     
-    # 시간 순서로 정렬 (혹시 뒤섞여 있을 경우를 대비)
-    df.sort_index(inplace=True)
-
-    # RSI 및 이동평균선 계산
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=RSI_PERIOD).rsi() 
-    df['ma_short'] = ta.trend.SMAIndicator(df['close'], window=MA_SHORT_PERIOD).sma_indicator()
-    df['ma_long'] = ta.trend.SMAIndicator(df['close'], window=MA_LONG_PERIOD).sma_indicator()
-
-    # NaN 값 제거 (지표 계산을 위해 필요한 초기 데이터 부족 부분)
-    df.dropna(inplace=True)
+    prev_month_values_before_current_month = portfolio_df.loc[portfolio_df.index <= prev_month_end_dt, 'total_krw']
+    if not prev_month_values_before_current_month.empty:
+        prev_month_start_value = prev_month_values_before_current_month.iloc[-1]
     
-    if df.empty:
-        print("지표 계산 후 유효한 데이터가 없습니다. 백테스트를 진행할 수 없습니다.")
-        return
-
-    print(f"\n총 {len(df)}개의 유효한 1시간봉 데이터로 백테스트를 시작합니다.")
-
-    # 백테스트를 위한 변수 초기화
-    krw_balance = INITIAL_KRW_BALANCE
-    btc_balance = 0.0
-    bought_price = 0.0 # 매수했던 가격
-    trades = [] # 거래 내역 저장 (날짜, 유형, 가격, 수량, KRW 변화, BTC 변화, 잔고)
-
-    # 이전 달 기록을 위한 변수
-    last_month = df.index[0].month
-    monthly_start_krw = INITIAL_KRW_BALANCE
-    monthly_returns = {}
-
-    for i, row in df.iterrows():
-        current_time = row.name
-        current_price = row['close']
-        current_rsi = row['rsi']
-        current_ma_short = row['ma_short']
-        current_ma_long = row['ma_long']
-
-        # 월별 수익률 계산을 위한 로직
-        if current_time.month != last_month:
-            # 이전 달의 수익률 계산 및 저장
-            monthly_end_krw = krw_balance + (btc_balance * current_price)
-            monthly_profit = monthly_end_krw - monthly_start_krw
-            monthly_return_percent = (monthly_profit / monthly_start_krw) * 100 if monthly_start_krw > 0 else 0
-            monthly_returns[current_time.replace(day=1)] = monthly_return_percent 
-            
-            # 다음 달의 시작 자본금 설정
-            monthly_start_krw = krw_balance + (btc_balance * current_price)
-            last_month = current_time.month
-
-        # ── 손절 조건 (가장 먼저 검사) ──
-        if btc_balance > 0 and bought_price > 0:
-            loss_percent = (bought_price - current_price) / bought_price 
-            if loss_percent >= STOP_LOSS_PERCENT:
-                # 손절 매도
-                sell_amount_btc = btc_balance
-                krw_gained = sell_amount_btc * current_price * (1 - TRADE_FEE_RATE)
-                krw_balance += krw_gained
-                btc_balance = 0.0
-                trades.append({
-                    'timestamp': current_time,
-                    'type': 'SELL (Stop Loss)',
-                    'price': current_price,
-                    'btc_amount': sell_amount_btc,
-                    'krw_change': krw_gained,
-                    'btc_change': -sell_amount_btc,
-                    'krw_balance': krw_balance,
-                    'btc_balance': btc_balance
-                })
-                bought_price = 0 # 매수 가격 초기화
-                continue # 손절 후 다른 조건 확인하지 않고 다음 봉으로 넘어감
-
-        # ── 매수 조건 ──
-        if (btc_balance == 0 and 
-            current_rsi <= RSI_BUY_THRESHOLD and 
-            krw_balance >= MIN_ORDER_KRW and
-            current_ma_short > current_ma_long): # 골든 크로스 조건
-
-            amount_to_buy_krw = krw_balance # KRW 전액 매수 
-            
-            if amount_to_buy_krw >= MIN_ORDER_KRW:
-                buy_amount_btc = (amount_to_buy_krw / current_price) * (1 - TRADE_FEE_RATE)
-                krw_balance -= amount_to_buy_krw
-                btc_balance += buy_amount_btc
-                bought_price = current_price # 매수 가격 기록
-                trades.append({
-                    'timestamp': current_time,
-                    'type': 'BUY',
-                    'price': current_price,
-                    'btc_amount': buy_amount_btc,
-                    'krw_change': -amount_to_buy_krw,
-                    'btc_change': buy_amount_btc,
-                    'krw_balance': krw_balance,
-                    'btc_balance': btc_balance
-                })
-
-        # ── 매도 조건 ──
-        elif btc_balance > 0 and current_rsi >= RSI_SELL_THRESHOLD: 
-            sell_amount_btc = btc_balance
-            krw_gained = sell_amount_btc * current_price * (1 - TRADE_FEE_RATE)
-            krw_balance += krw_gained
-            btc_balance = 0.0
-            trades.append({
-                'timestamp': current_time,
-                'type': 'SELL',
-                'price': current_price,
-                'btc_amount': sell_amount_btc,
-                'krw_change': krw_gained,
-                'btc_change': -sell_amount_btc,
-                'krw_balance': krw_balance,
-                'btc_balance': btc_balance
-            })
-            bought_price = 0 # 매도했으므로 매수 가격 초기화
-
-    # 백테스트 종료 시점에 남아있는 자산 처리 (현금 + BTC 평가액)
-    final_krw_balance = krw_balance + (btc_balance * df['close'].iloc[-1])
+    monthly_return_pct = ((current_month_value / prev_month_start_value) - 1) * 100
+    month_str = month_end_date.strftime('%Y-%m')
     
-    # 마지막 월 수익률 계산 (백테스트 종료 시점의 달)
-    monthly_end_krw = krw_balance + (btc_balance * df['close'].iloc[-1])
-    monthly_profit = monthly_end_krw - monthly_start_krw
-    monthly_return_percent = (monthly_profit / monthly_start_krw) * 100 if monthly_start_krw > 0 else 0
-    monthly_returns[df.index[-1].replace(day=1)] = monthly_return_percent
+    print(f"{month_str}: {monthly_return_pct:.2f}%")
+    total_monthly_returns_list.append(monthly_return_pct)
 
-    # ───────────────────────────────
-    # 6. 백테스트 결과 출력
-    # ───────────────────────────────
-    print("\n--- 백테스트 결과 ---")
+# 월평균 수익률 (산술 평균)
+if total_monthly_returns_list:
+    avg_monthly_return = sum(total_monthly_returns_list) / len(total_monthly_returns_list)
+    print(f"\n월평균 수익률: {avg_monthly_return:.2f}%")
+else:
+    print("\n월별 수익률 데이터가 충분하지 않습니다.")
 
-    # 누적 수익률 계산
-    cumulative_return = ((final_krw_balance - INITIAL_KRW_BALANCE) / INITIAL_KRW_BALANCE) * 100
-    print(f"초기 자본: {INITIAL_KRW_BALANCE:,.0f}원")
-    print(f"최종 자산: {final_krw_balance:,.0f}원")
-    print(f"누적 수익률: {cumulative_return:.2f}%")
-
-    # 월별 수익률 출력
-    print("\n--- 월별 수익률 ---")
-    # 월별 수익률 딕셔너리를 날짜 기준으로 정렬
-    sorted_monthly_returns = sorted(monthly_returns.items())
-    for month_start, ret in sorted_monthly_returns:
-        print(f"{month_start.strftime('%Y년 %m월')}: {ret:.2f}%")
-
-    print("\n--- 전체 거래 내역 (상위 10개) ---")
-    trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        print(trades_df.head(10))
-        print(f"\n총 {len(trades_df)}건의 거래 발생.")
-    else:
-        print("거래가 발생하지 않았습니다.")
-
-    # 추가적으로 원금만으로 비트코인을 보유했을 때의 수익률 (벤치마크)
-    print("\n--- 벤치마크 (BTC 단순 보유) ---")
-    # 시작 시점 비트코인 가격
-    benchmark_initial_price = df['close'].iloc[0]
-    # 종료 시점 비트코인 가격
-    benchmark_final_price = df['close'].iloc[-1]
-    
-    # 초기 자본으로 구매할 수 있었던 BTC 수량
-    initial_btc_amount_benchmark = INITIAL_KRW_BALANCE / benchmark_initial_price
-    # 최종 BTC 가치
-    final_btc_value_benchmark = initial_btc_amount_benchmark * benchmark_final_price
-    # 벤치마크 수익률
-    benchmark_return = ((final_btc_value_benchmark - INITIAL_KRW_BALANCE) / INITIAL_KRW_BALANCE) * 100
-    print(f"시작 시점 BTC 가격: {benchmark_initial_price:,.0f}원")
-    print(f"종료 시점 BTC 가격: {benchmark_final_price:,.0f}원")
-    print(f"BTC 단순 보유 시 최종 자산: {final_btc_value_benchmark:,.0f}원")
-    print(f"BTC 단순 보유 시 수익률: {benchmark_return:.2f}%")
-
-# 백테스트 실행
-if __name__ == "__main__":
-    run_backtest()
+print("\n--- 백테스팅 종료 ---")
